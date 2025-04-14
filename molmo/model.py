@@ -664,7 +664,6 @@ class FullMolmoConfig:
     multi_query_attention: Optional[bool] = None
     attention_layer_norm: bool = False
     residual_dropout: float = 0.1
-    response_residual_dropout: float = 0.0
     embedding_dropout: float = 0.1
     layer_norm_type: str = "default"
     layer_norm_with_affine: bool = True
@@ -846,6 +845,7 @@ class VisionTransformer(nn.Module):
     def __init__(self, config: FullMolmoConfig):
         super().__init__()
         self.config = config
+
         v_cfg = config.vision_backbone
         # class embeddings and positional embeddings
         self.scale = v_cfg.image_emb_dim ** -0.5
@@ -856,6 +856,7 @@ class VisionTransformer(nn.Module):
         self.positional_embedding = nn.Parameter(
             torch.zeros(v_cfg.image_num_pos, v_cfg.image_emb_dim, device=config.init_device),
         )
+
         image_patch_size = v_cfg.image_patch_size
         self.patch_embedding = nn.Linear(
             image_patch_size * image_patch_size * 3,
@@ -914,6 +915,7 @@ class VisionTransformer(nn.Module):
         B, N, D = x.shape
 
         x = self.patch_embedding(x)
+
         # class embeddings and positional embeddings
         x = torch.cat([_expand_token(self.class_embedding, x.shape[0]).to(x.dtype), x], dim=1)
         x = self.add_pos_emb(x, patch_num)
@@ -1239,6 +1241,7 @@ class OLMoVisionBackbone(nn.Module):
         super().__init__()
         self.config = config
         self.image_vit = VisionTransformer(config)
+
         input_dim: int = None
         self.image_pooling_2d: nn.Module = None
         if config.image_pooling_2d in {ImagePooling2DType.attention, ImagePooling2DType.attention_meanq}:
@@ -1351,7 +1354,7 @@ class OLMoPretrainedVisionBackbone(OLMoVisionBackbone):
         v_cfg = self.config.vision_backbone
         B, T, N, D = images.shape
         
-        # print('>> images.shape', images.shape) # (batch_size, num_crops, num_patch, n_pixels) #[1, 13, 576, 588]
+        print('>> images.shape', images.shape) # (batch_size, num_crops, num_patch, n_pixels) #[1, 13, 576, 588]
 
         mask = ~torch.all(images.view(B * T, N, D) == -1, dim=(1, 2), keepdim=True)
 
@@ -1444,6 +1447,7 @@ class OLMoPretrainedVisionBackbone(OLMoVisionBackbone):
 
         h, w = cfg.llm_patches_per_crop()
         image_features = image_features.reshape(batch_size, num_image, h * w, -1)
+
         # MLP layer to map the feature.
         if self.grad_checkpointing:
             from torch.utils.checkpoint import checkpoint
@@ -1893,6 +1897,7 @@ class Molmo(nn.Module):
 
             # For hf demo/endpoint
             image_features = image_features.to(x.device)
+
             x[batch_idx[valid], image_input_idx[valid]] += image_features[valid]
 
         if not self.config.rope:
@@ -2023,38 +2028,6 @@ class Molmo(nn.Module):
         return ModelOutput(logits=logits, attn_key_values=attn_key_values, hidden_states=tuple(all_hidden_states) if output_hidden_states else None)  # type: ignore[arg-type]
 
 
-    def get_fsdp_wrap_policy(self, wrap_strategy = None):
-        if wrap_strategy is None:
-            return None
-
-        # The 'recurse' mode for the wrap function does not behave like you'd expect.
-        # Even if we return False, it may still recurse because PyTorch does what it wants,
-        # not what you want. This causes issues when, for example, we want to wrap 'ff_out' (a linear layer)
-        # but not other linear layers within a block.
-        # So we have to explicitly tell PyTorch which linear layers to wrap, and we also just
-        # return True in 'recurse' mode for simplicity.
-        size_based_module_to_wrap = {self.transformer.wte}
-        if hasattr(self.transformer, "ff_out"):
-            size_based_module_to_wrap.add(self.transformer.ff_out)
-        if hasattr(self.transformer, "ln_f"):
-            size_based_module_to_wrap.add(self.transformer.ln_f)
-        if self.vision_backbone is not None and self.config.vision_backbone.fsdp_wrap:
-            size_based_module_to_wrap.add(self.vision_backbone.image_pooling_2d)
-            size_based_module_to_wrap.add(self.vision_backbone.image_projector)
-
-        wrap_layer_names = (ResidualAttentionBlock, OLMoVisionBackbone, VisionTransformer)
-
-        def fsdp_wrap_fn(module, recurse: bool = True, nonwrapped_numel: int = 0):
-            del nonwrapped_numel
-            wrap = isinstance(module, wrap_layer_names + (MolmoBlock,)) or module in size_based_module_to_wrap
-            if recurse:
-                return True
-            else:
-                return wrap
-
-        return fsdp_wrap_fn
-       
-
 class MolmoForCausalLM(PreTrainedModel):
     config_class = MolmoConfig
     base_model_prefix = "model"
@@ -2062,10 +2035,11 @@ class MolmoForCausalLM(PreTrainedModel):
 
     def __init__(self, config: MolmoConfig, model: Optional[Molmo] = None, init_params: bool = False):
         super().__init__(config)
+
         if not model:
             full_config = FullMolmoConfig(
-                image_padding_embed=None,
-                image_pooling_2d="attention",
+                image_padding_embed="pad_and_partial_pad",
+                image_pooling_2d="attention-meanq",
                 attention_layer_norm=config.attention_layer_norm,
                 rope_impl="llama",
                 vocab_size=config.vocab_size,
@@ -2172,9 +2146,6 @@ class MolmoForCausalLM(PreTrainedModel):
         loss = None
         if labels is not None:
             if loss_masks is not None:
-                labels = labels.to(logits.device)
-                loss_masks = loss_masks.to(logits.device)
-
                 loss_masks = loss_masks * (loss_masks > 0)
                 batch_size_in_tokens = max(loss_masks.sum().item(), 1)
                 labels = labels.long()
@@ -2186,12 +2157,20 @@ class MolmoForCausalLM(PreTrainedModel):
                 # Validate labels range (ignoring -100)
                 vocab_size = logits_for_loss.size(-1) #TODO
                 validate_labels(labels, vocab_size, ignore_index=-100) #TODO
-
+                
                 loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
                 loss = loss_fct(logits_for_loss, labels)
                 loss = loss.view(input_ids.shape[0], -1)
                 loss = loss * loss_masks
                 loss = loss.sum() / batch_size_in_tokens
+                use_zloss = getattr(self.config, "softmax_auxiliary_loss", False)
+                if use_zloss:
+                    z_squared = logits_for_loss.logsumexp(-1).pow(2)
+                    z_loss = self.config.softmax_auxiliary_loss_scale * z_squared
+                    z_loss = z_loss.view(input_ids.shape[0], -1)
+                    z_loss = z_loss * loss_masks
+                    z_loss = z_loss.sum() / batch_size_in_tokens
+                    loss += z_loss
             else:
                 # Shift so that tokens < n predict n
                 shift_logits = logits[..., :-1, :].contiguous()
@@ -2415,4 +2394,4 @@ class MolmoForCausalLM(PreTrainedModel):
 
 
 # Always register for multi-modal features
-AutoModelForCausalLM.register(MolmoConfig, MolmoForCausalLM)
+# AutoModelForCausalLM.register(MolmoConfig, MolmoForCausalLM)

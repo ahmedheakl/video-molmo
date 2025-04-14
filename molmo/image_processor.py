@@ -14,15 +14,12 @@ from transformers.image_utils import (
     ImageInput,
     is_valid_image,
 )
+from transformers.processing_utils import ImagesKwargs
 from transformers.image_processing_utils import BaseImageProcessor
+from transformers.utils import logging
 
-import torchvision.transforms as T
 
-from transformers import AutoTokenizer
-
-# model_id = 'allenai/MolmoE-1B-0924'
-model_id = "allenai/Molmo-7B-D-0924"
-tokenizer = AutoTokenizer.from_pretrained(model_id)
+logger = logging.get_logger(__name__)
 
 
 def pad_to_bounding_box(
@@ -130,7 +127,16 @@ def select_tiling(h, w, patch_size, max_num_patches):
         ix = np.argmin(required_scale)
     return candidate_tilings[ix]
 
-from transformers.image_processing_utils import BaseImageProcessor
+
+class MolmoImagesKwargs(ImagesKwargs, total=False):
+    max_crops: Optional[int]
+    overlap_margins: Optional[List[int]]
+    base_image_input_size: Optional[List[int]]
+    image_token_length_w: Optional[int]
+    image_token_length_h: Optional[int]
+    image_patch_size: Optional[int]
+    image_padding_mask: Optional[bool]
+
 
 class MolmoImageProcessor(BaseImageProcessor):
     """Preprocess images and multi-model inputs"""
@@ -163,37 +169,21 @@ class MolmoImageProcessor(BaseImageProcessor):
 
     def image_to_patches_and_tokens(
         self,
-        image: ImageInput, # (h, w, c)
-        
+        image: ImageInput,
         image_patch_token_id: int,
         image_col_token_id: int,
         image_start_token_id: int,
         image_end_token_id: int,
-        frame_start_token_id: int,
-        frame_end_token_id: int,
-        
         max_crops: Optional[int] = None,
         overlap_margins: Optional[List[int]] = None,
-        
         base_image_input_size: Optional[Union[int, List[int]]] = None,
         image_token_length_w: Optional[int] = None,
         image_token_length_h: Optional[int] = None,
         image_patch_size: Optional[int] = None,
     ):
-        '''
-        Returns: ???
-            patches: (n_crops, n_patches, patch_dim) individual crops, `n_crops` might
-                     change between images but the other dimension are fixed
-            tokens: (n_tokens,) int32 tokens, pad tokens indicate where to insert the
-                                    patch features, might include other special tokens as well
-            patch_ordering: (n_crops, n_patches) index in `tokens` to put the patch features from the
-                           crops after pooling, negative values indicates patches features to exclude
-            padding_mask: (n_crops, n_patches) what percent of each crop is padding, can be None
-                          if the image mask is not being used.
-                          
-        '''
         if isinstance(base_image_input_size, int):
             base_image_input_size = (base_image_input_size, base_image_input_size)
+
         base_image_input_d = image_patch_size
         tokens_per_image = image_token_length_w * image_token_length_h
         image_base_patch_w = base_image_input_size[1] // base_image_input_d
@@ -354,37 +344,25 @@ class MolmoImageProcessor(BaseImageProcessor):
                     extra_tokens,
                     [image_end_token_id],
                 ] + joint
-        # add frame start and frame end token ids
-        joint = [
-                    [frame_start_token_id],
-                    *joint,
-                    [frame_end_token_id]
-                ]
+
         joint = np.concatenate(joint, 0)
         img_mask = np.pad(img_mask, [[0, 1], [0, 0]], constant_values=-1)
         return patches, joint, patch_ordering, img_mask
 
     def build_image_input_idx(
         self,
-        image_tokens: np.ndarray, # (n_tokens,)
-        patch_order: np.ndarray, # (n_crops, n_patches)
-        
+        image_tokens: np.ndarray,
+        patch_order: np.ndarray,
         image_patch_token_id: int,
         no_image: Optional[bool] = None,
         image_token_length_w: Optional[int] = None,
         image_token_length_h: Optional[int] = None,
     ):
         """Converts `patch_order` into a mapping of token_id -> patch_id"""
-        
-        """
-        Returns:
-            image_input_idx: (n_crops, n_patches) index in `tokens` to put the patch features from the
-                           crops after pooling, negative values indicates patches features to exclude
-        """
 
         tokens_per_image = image_token_length_w * image_token_length_h
         if no_image is not None and no_image:
-            return np.zeros((0, tokens_per_image), np.int32) # (0, tokens_per_image)
+            return np.zeros((0, tokens_per_image), np.int32)
 
         # Indices to insert the patches
         image_input_idx = image_tokens == image_patch_token_id
@@ -392,7 +370,7 @@ class MolmoImageProcessor(BaseImageProcessor):
 
         if patch_order is not None:
             n_tokens = image_input_idx.shape[0]
-            patch_order = np.reshape(patch_order, [-1]) # (n_crops * n_patches)
+            patch_order = np.reshape(patch_order, [-1])
             n_patches = patch_order.shape[0]
 
             valid = patch_order >= 0
@@ -415,13 +393,11 @@ class MolmoImageProcessor(BaseImageProcessor):
 
     def preprocess(
         self,
-        image: np.ndarray, # (h, w, c)
+        image: np.ndarray,
         image_patch_token_id: int,
         image_col_token_id: int,
         image_start_token_id: int,
         image_end_token_id: int,
-        frame_start_token_id: int,
-        frame_end_token_id: int,
         max_crops: Optional[int] = None,
         overlap_margins: Optional[List[int]] = None,
         base_image_input_size: Optional[Union[int, List[int]]] = None,
@@ -450,15 +426,12 @@ class MolmoImageProcessor(BaseImageProcessor):
         image_token_length_h = image_token_length_h or self.image_token_length_h
         image_patch_size = image_patch_size or self.image_patch_size
 
-        # TODO: what is this function doing?
         crops, image_tokens, patch_ordering, img_mask = self.image_to_patches_and_tokens(
-            image, # (h, w, c)
+            image,
             image_patch_token_id,
             image_col_token_id,
             image_start_token_id,
             image_end_token_id,
-            frame_start_token_id,
-            frame_end_token_id,
             max_crops,
             overlap_margins,
             base_image_input_size,
@@ -466,12 +439,7 @@ class MolmoImageProcessor(BaseImageProcessor):
             image_token_length_h,
             image_patch_size,
         )
-        # crops: (n_crops, n_patches, patch_dim)
-        # image_tokens: (n_tokens,)
-        # patch_idx: (n_crops, n_patches)
-        # img_mask: (n_crops, n_patches)
-                
-        patch_idx = self.build_image_input_idx( #TODO: what is this function doing?
+        patch_idx = self.build_image_input_idx(
             image_tokens,
             patch_ordering,
             image_patch_token_id,
@@ -482,17 +450,14 @@ class MolmoImageProcessor(BaseImageProcessor):
 
     def multimodal_preprocess(
         self,
-        images: np.ndarray, # (n_images, h, w, c)
+        images: np.ndarray,
         tokens: List[int],
-        image_idx: np.ndarray, # (n_images,)
+        image_idx: np.ndarray,
         sequence_length: int,
         image_patch_token_id: int,
         image_col_token_id: int,
         image_start_token_id: int,
         image_end_token_id: int,
-        frame_start_token_id: int,
-        frame_end_token_id: int, 
-        loss_mask: List[bool],
         **kwargs,
     ):
         """Merge images and text tokens into multi-modal features for the model
@@ -506,7 +471,6 @@ class MolmoImageProcessor(BaseImageProcessor):
         :params image_end_token_id: token id for image end special tokens
         :params kwargs: override preprocessor default args
         """
-
         max_total_crops = kwargs.get("max_crops") or self.max_crops
         image_token_length_w = kwargs.get("image_token_length_w") or self.image_token_length_w
         image_token_length_h = kwargs.get("image_token_length_h") or self.image_token_length_h
@@ -517,6 +481,7 @@ class MolmoImageProcessor(BaseImageProcessor):
             base_image_input_size[1] // image_patch_size,
         )
         image_padding_mask = kwargs.get("image_padding_mask") or self.image_padding_mask
+
         tokens_per_image = image_token_length_w * image_token_length_h
         n_pixels = image_patch_size * image_patch_size * 3
         n_patches = image_num_patch[0] * image_num_patch[1]
@@ -525,80 +490,57 @@ class MolmoImageProcessor(BaseImageProcessor):
             return {
                 "input_ids": tokens,
             }
-        n = len(images)
-        all_crops = []
-        all_image_idx = []
-        out_tokens = []
-        all_crop_masks = []
-        all_loss_masks = []
-        for ix in range(n):
-            token_ix = image_idx[ix]
-            crops, image_tokens, patch_idx, img_mask = self.preprocess( #TODO: what is the output of this function?
-                    images[ix], # (h, w, c)
+        else:
+            n = len(images)
+            all_crops = []
+            all_image_idx = []
+            out_tokens = []
+            all_crop_masks = []
+
+            for ix in range(n):
+                token_ix = image_idx[ix]
+                crops, image_tokens, patch_idx, img_mask = self.preprocess(
+                    images[ix],
                     image_patch_token_id,
                     image_col_token_id,
                     image_start_token_id,
                     image_end_token_id,
-                    frame_start_token_id,
-                    frame_end_token_id,
                     **kwargs,
-                )    
-            if token_ix == -1:  # -1 is an image inserted at the very start
-                start = 0
-                token_ix = 0
-                end = 0
-            else:
-                start = 0 if ix == 0 else image_idx[ix-1] + 1
-                end = token_ix + 1
+                )
 
-            all_image_idx.append(patch_idx + token_ix)
-            all_crops.append(crops)
+                if token_ix == -1:  # -1 is an image inserted at the very start
+                    start = 0
+                    token_ix = 0
+                    end = 0
+                else:
+                    start = 0 if ix == 0 else image_idx[ix-1] + 1
+                    end = token_ix + 1
 
-            out_tokens.append(tokens[start:token_ix])
-            all_loss_masks.append(loss_mask[start:token_ix])
+                all_image_idx.append(patch_idx + token_ix)
+                all_crops.append(crops)
+                out_tokens.append(tokens[start:token_ix])
+                out_tokens.append(image_tokens)
+                if ix == (n - 1):
+                    out_tokens.append(tokens[end:])
+                if image_padding_mask:
+                    all_crop_masks.append(img_mask)
 
-            out_tokens.append(image_tokens)
-            
-            all_loss_masks.append(np.zeros(image_tokens.shape[0], dtype=np.float32))
+            input_ids = np.concatenate(out_tokens, 0)
+            images = np.concatenate(all_crops, 0)
+            image_input_idx = np.concatenate(all_image_idx, 0)
             if image_padding_mask:
-                all_crop_masks.append(img_mask)
+                image_masks = np.concatenate(all_crop_masks, 0)
+            else:
+                image_masks = None
 
-        end = image_idx[-1] + 1
-        out_tokens.append(tokens[end:])
-        all_loss_masks.append(loss_mask[end:])
-
-        input_ids = np.concatenate(out_tokens, 0)
-        images = np.concatenate(all_crops, 0)
-        image_input_idx = np.concatenate(all_image_idx, 0)
-        all_loss_masks = np.concatenate(all_loss_masks, 0)
-
-        target_tokens = input_ids
-        ends_with_eos = input_ids[-1] == tokenizer.eos_token_id
-
-        if not ends_with_eos and loss_mask[-1]:
-            raise RuntimeError("EOS should not be masked")
-
-        bos = tokenizer.bos_token_id or tokenizer.eos_token_id
-        input_ids = np.pad(input_ids, [[1, 0]], constant_values=bos)
-        if ends_with_eos:
-            input_ids = input_ids[:-1]
-        else:
-            # We are presumably doing inference since the messages end with user response instead
-            # of a target response, so these fields should not be used, but pad them anyway
-            # just so everything is a consistent length
-            all_loss_masks = np.pad(all_loss_masks, [[0, 1]], constant_values=-1)
-            target_tokens = np.pad(target_tokens, [[0, 1]], constant_values=-1)
-
-        image_input_idx = np.where(image_input_idx < 0, image_input_idx, image_input_idx + 1)
         out = {
             "input_ids": input_ids,
             "images": images,
-            "image_input_idx": image_input_idx,
-            "loss_masks": all_loss_masks,
-            "labels": target_tokens,
+            "image_input_idx": image_input_idx
         }
-        if image_padding_mask:
-            out["image_masks"] = np.concatenate(all_crop_masks, 0)
-       
-        out["position_ids"] = np.arange(len(input_ids), dtype=np.int64)
+        if image_masks is not None:
+            out["image_masks"] = image_masks
         return out
+
+
+MolmoImageProcessor.register_for_auto_class()

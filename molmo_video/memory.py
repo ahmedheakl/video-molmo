@@ -988,14 +988,12 @@ class MultiHeadDotProductAttention(nn.Module):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.embed_dim,))
 
     def forward(self, inputs_q: torch.Tensor, inputs_kv: Optional[torch.Tensor] = None) -> torch.Tensor:
-
         if inputs_kv is not None:
             inputs_k = inputs_kv
             inputs_v = inputs_kv
         else:
             inputs_k = inputs_q
             inputs_v = inputs_q
-
         xq, xk, xv = self.wq(inputs_q), self.wk(inputs_k), self.wv(inputs_v)
 
         xq = self._split_heads(xq, self.num_heads)
@@ -1031,6 +1029,7 @@ class MultiHeadDotProductAttention(nn.Module):
             ).transpose(1, 2)
         else:
             raise NotImplementedError(self.config.attention_type)
+
         attn_output = attn_output.to(og_dtype)
         attn_output = self._merge_heads(attn_output)
         attn_output = self.wo(attn_output)
@@ -1233,11 +1232,147 @@ class Residual(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.submodule(x)
 
+class CNNAdapter(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        v_cfg = config.vision_backbone
+        dim = len(config.vit_layers)*v_cfg.image_emb_dim
+        self.layer = nn.Conv2d(in_channels=dim, out_channels=dim, kernel_size=7, padding=3, bias=False)
+        nn.init.zeros_(self.layer.weight)
+
+    def forward(self, x):
+        B, T, N, D = x.shape
+        x = x.view(B*T, N, D)
+        p = int(math.sqrt(N))
+        x = x.view(B*T, p, p, D).permute(0, 3, 1, 2)
+        x = self.layer(x)
+        x = x.permute(0, 2, 3, 1)
+        x = x.view(B*T, N, D)
+        x = x.view(B, T, N, D)
+        return x
+
+class MemoryAttention(nn.Module):
+    def __init__(self, config: FullMolmoConfig, use_bias: bool = False, is_vit_layer: Optional[bool] = True):
+        super().__init__()
+        self.config = config
+        self.use_bias = use_bias
+
+        v_cfg = config.vision_backbone
+        self.embed_dim = v_cfg.image_emb_dim
+        self.num_heads = v_cfg.image_num_heads
+        self.head_dim = v_cfg.image_head_dim
+        self.num_key_value_heads = v_cfg.image_num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.initializer_range = v_cfg.initializer_range
+        self.is_vit_layer = is_vit_layer
+
+        nlayers = 1 if (is_vit_layer or config.vit_layers is None) else len(config.vit_layers)
+
+        self.wq = nn.Linear(
+            nlayers * self.embed_dim,
+            self.num_heads * self.head_dim,
+            bias=use_bias,
+            device=config.init_device,
+            )
+        self.wk = nn.Linear(
+            nlayers * self.embed_dim,
+            self.num_key_value_heads * self.head_dim,
+            bias=use_bias,
+            device=config.init_device,
+            )
+        self.wv = nn.Linear(
+            nlayers * self.embed_dim,
+            self.num_key_value_heads * self.head_dim,
+            bias=use_bias,
+            device=config.init_device,
+            )
+        self.wo = nn.Linear(
+            self.num_heads * self.head_dim,
+            nlayers*self.embed_dim,
+            bias=use_bias,
+            device=config.init_device,
+            )
+        self.attention_dropout: Optional[Dropout] = None
+        if v_cfg.attention_dropout > 0:
+            self.attention_dropout = Dropout(v_cfg.attention_dropout, broadcast_dims=(0, 1))
+        self.residual_dropout = Dropout(v_cfg.residual_dropout)
+
+
+    def reset_parameters(self):
+        nn.init.normal_(self.wq.weight, std=self.initializer_range)
+        nn.init.normal_(self.wk.weight, std=self.initializer_range)
+        nn.init.normal_(self.wv.weight, std=self.initializer_range)
+        nn.init.normal_(self.wo.weight, std=self.initializer_range)
+        if self.use_bias:
+            nn.init.constant_(self.wq.bias, 0)
+            nn.init.constant_(self.wk.bias, 0)
+            nn.init.constant_(self.wv.bias, 0)
+            nn.init.constant_(self.wo.bias, 0)
+
+    def _split_heads(self, hidden_states, num_heads) -> torch.Tensor:
+        return hidden_states.reshape(hidden_states.shape[:2] + (num_heads, self.head_dim))
+
+    def _merge_heads(self, hidden_states) -> torch.Tensor:
+        return hidden_states.reshape(hidden_states.shape[:2] + (self.embed_dim,))
+
+    def forward(self, inputs_q: torch.Tensor, inputs_kv: Optional[torch.Tensor] = None) -> torch.Tensor:
+        num_frames = inputs_kv.shape[0] // inputs_q.shape[0]
+        inputs_q = inputs_q.repeat_interleave(num_frames, dim=0)
+        if inputs_kv is not None:
+            inputs_k = inputs_kv
+            inputs_v = inputs_kv
+        else:
+            inputs_k = inputs_q
+            inputs_v = inputs_q
+
+        xq, xk, xv = self.wq(inputs_q), self.wk(inputs_k), self.wv(inputs_v)
+
+        xq = self._split_heads(xq, self.num_heads)
+        xk = self._split_heads(xk, self.num_key_value_heads)
+        xv = self._split_heads(xv, self.num_key_value_heads)
+
+        if self.num_heads != self.num_key_value_heads:
+            xk = xk.repeat_interleave(self.num_key_value_groups, dim=2, output_size=self.num_heads)
+            xv = xv.repeat_interleave(self.num_key_value_groups, dim=2, output_size=self.num_heads)
+
+        og_dtype = xq.dtype
+
+        if self.config.float32_attention:
+            xq = xq.to(torch.float)
+            xk = xk.to(torch.float)
+
+        if self.config.attention_type == "direct":
+            attn_weights = torch.einsum("...qhd,...khd->...hqk", xq / math.sqrt(xq.size(-1)), xk)
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(xq.dtype)
+            if self.attention_dropout is not None:
+                attn_weights = self.attention_dropout(attn_weights)
+            attn_output = torch.einsum("...hqk,...khd->...qhd", attn_weights.to(xv.dtype), xv)
+
+        elif self.config.attention_type == "sdpa":
+            if self.config.float32_attention and not torch.is_autocast_enabled():
+                xv = xv.to(torch.float32)
+            attn_output = F.scaled_dot_product_attention(
+                xq.transpose(1, 2).contiguous(),
+                xk.transpose(1, 2).contiguous(),
+                xv.transpose(1, 2).contiguous(),
+                is_causal=False,
+                dropout_p=self.config.vision_backbone.attention_dropout
+            ).transpose(1, 2)
+        else:
+            raise NotImplementedError(self.config.attention_type)
+        attn_output = attn_output.to(og_dtype)
+        attn_output = self._merge_heads(attn_output)
+        attn_output = self.wo(attn_output)
+        attn_output = self.residual_dropout(attn_output)
+
+        return attn_output
+
 
 class OLMoVisionBackbone(nn.Module):
     def __init__(self, config: FullMolmoConfig):
         super().__init__()
         self.config = config
+        v_cfg = self.config.vision_backbone
         self.image_vit = VisionTransformer(config)
         input_dim: int = None
         self.image_pooling_2d: nn.Module = None
@@ -1276,7 +1411,10 @@ class OLMoVisionBackbone(nn.Module):
         else:
             raise NotImplementedError(f"Unknown image pooling 2D method: {config.image_pooling_2d}")
 
-        self.input_dim = input_dim
+        # init a CNN layer
+        # self.adapter = CNNAdapter(self.config)
+        self.adapter = MemoryAttention(config, is_vit_layer=False)
+
 
         # `MLP` assume the activation takes two inputs, so it must be a 'llama' version
         if config.activation_type == ActivationType.swiglu:
@@ -1383,13 +1521,14 @@ class OLMoPretrainedVisionBackbone(OLMoVisionBackbone):
 
         return image_features, cls_embed
 
-    def forward(self, images: torch.Tensor, image_masks: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, images: torch.Tensor, prev_frames: torch.Tensor, image_masks: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         cfg = self.config
 
         # image_features: (batch_size, num_crops(=num_image), num_patch, nximage_emb_dim)
         batch_size, num_image = images.shape[:2]
         image_features, cls_embed = self.encode_image(images)
-
+        prev_features, _ = self.encode_image(prev_frames)
+       
         if cfg.image_padding_embed:
             assert image_masks is not None
             if cfg.image_padding_embed == "pad_embed":
@@ -1416,6 +1555,9 @@ class OLMoPretrainedVisionBackbone(OLMoVisionBackbone):
         image_features = image_features.reshape(
             (batch_size, num_image) + cfg.image_num_patch + (-1,),
             )
+        prev_features = prev_features.reshape(
+            (batch_size, prev_features.shape[1]) + cfg.image_num_patch + (-1,),
+        )
 
         if cfg.image_num_patch[0] % cfg.image_pooling_h == 1:
             # Pad so we can still pool 2x2 patches
@@ -1423,6 +1565,11 @@ class OLMoPretrainedVisionBackbone(OLMoVisionBackbone):
                 image_features,
                 (0, 0, 0, 1, 0, 1, 0, 0, 0, 0),
             )
+            prev_features = F.pad(
+                prev_features,
+                (0, 0, 0, 1, 0, 1, 0, 0, 0, 0),
+            )
+
 
         # image pooling
         image_features = einops.rearrange(
@@ -1431,8 +1578,27 @@ class OLMoPretrainedVisionBackbone(OLMoVisionBackbone):
             dh=cfg.image_pooling_h,
             dw=cfg.image_pooling_w,
         )
+        prev_features = einops.rearrange(
+            prev_features,
+            'b n (h dh) (w dw) c -> (b n h w) (dh dw) c',
+            dh=cfg.image_pooling_h,
+            dw=cfg.image_pooling_w,
+        )
 
-        if cfg.image_pooling_2d == ImagePooling2DType.attention_meanq:
+        # # MODIFY
+        # adapted_features = self.adapter(image_features, prev_features)
+        # num_frames = prev_features.shape[0] // image_features.shape[0]
+        # b, p, d = image_features.shape
+        # adapted_features = adapted_features.view(b, num_frames, p, d)
+        # adapted_features = adapted_features.mean(dim=1)
+        # image_features = image_features + adapted_features
+        # # MODIFY
+
+        # MODIFY
+        image_features = image_features + prev_features
+        # MODIFY
+
+        if cfg.image_pooling_2d == ImagePooling2DType.attention_meanq:  
             query = image_features.mean(-2, keepdim=True)
             image_features = self.image_pooling_2d(query, image_features)
         elif cfg.image_pooling_2d not in {ImagePooling2DType.none, ImagePooling2DType.stack}:
@@ -1790,6 +1956,7 @@ class Molmo(nn.Module):
         attention_bias: Optional[torch.Tensor] = None,
         response_mask: Optional[torch.Tensor] = None,
         images: Optional[torch.Tensor] = None,
+        prev_frames: Optional[torch.Tensor] = None,
         image_masks: Optional[torch.Tensor] = None,
         image_input_idx: Optional[torch.Tensor] = None,
         subsegment_ids: Optional[torch.Tensor] = None,
@@ -1879,7 +2046,7 @@ class Molmo(nn.Module):
         if images is not None:
             # shape: (batch_size, num_image, num_patch, d_model)
             # cls_embed: (batch_size, num_image, d_model)
-            image_features, cls_embed = self.vision_backbone(images, image_masks)
+            image_features, cls_embed = self.vision_backbone(images, prev_frames, image_masks)
             num_image, num_patch = image_features.shape[1:3]
             assert image_input_idx.shape == (batch_size, num_image, num_patch)
 
@@ -1894,6 +2061,7 @@ class Molmo(nn.Module):
             # For hf demo/endpoint
             image_features = image_features.to(x.device)
             x[batch_idx[valid], image_input_idx[valid]] += image_features[valid]
+
 
         if not self.config.rope:
             # Get positional embeddings.
@@ -2065,7 +2233,7 @@ class MolmoForCausalLM(PreTrainedModel):
         if not model:
             full_config = FullMolmoConfig(
                 image_padding_embed=None,
-                image_pooling_2d="attention",
+                image_pooling_2d="attention-meanq",
                 attention_layer_norm=config.attention_layer_norm,
                 rope_impl="llama",
                 vocab_size=config.vocab_size,
@@ -2122,6 +2290,7 @@ class MolmoForCausalLM(PreTrainedModel):
         attention_bias: Optional[torch.Tensor] = None,
         response_mask: Optional[torch.Tensor] = None,
         images: Optional[torch.Tensor] = None,
+        prev_frames: Optional[torch.Tensor] = None,
         image_masks: Optional[torch.Tensor] = None,
         image_input_idx: Optional[torch.Tensor] = None,
         subsegment_ids: Optional[torch.Tensor] = None,
@@ -2155,6 +2324,7 @@ class MolmoForCausalLM(PreTrainedModel):
             attention_bias=attention_bias,
             response_mask=response_mask,
             images=images,
+            prev_frames=prev_frames,
             image_masks=image_masks,
             image_input_idx=image_input_idx,
             subsegment_ids=subsegment_ids,

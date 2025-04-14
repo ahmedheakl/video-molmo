@@ -846,6 +846,7 @@ class VisionTransformer(nn.Module):
     def __init__(self, config: FullMolmoConfig):
         super().__init__()
         self.config = config
+
         v_cfg = config.vision_backbone
         # class embeddings and positional embeddings
         self.scale = v_cfg.image_emb_dim ** -0.5
@@ -856,6 +857,7 @@ class VisionTransformer(nn.Module):
         self.positional_embedding = nn.Parameter(
             torch.zeros(v_cfg.image_num_pos, v_cfg.image_emb_dim, device=config.init_device),
         )
+
         image_patch_size = v_cfg.image_patch_size
         self.patch_embedding = nn.Linear(
             image_patch_size * image_patch_size * 3,
@@ -914,6 +916,7 @@ class VisionTransformer(nn.Module):
         B, N, D = x.shape
 
         x = self.patch_embedding(x)
+
         # class embeddings and positional embeddings
         x = torch.cat([_expand_token(self.class_embedding, x.shape[0]).to(x.dtype), x], dim=1)
         x = self.add_pos_emb(x, patch_num)
@@ -1233,12 +1236,51 @@ class Residual(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.submodule(x)
 
+class QFormer(nn.Module):
+    def __init__(self, 
+                 num_queries=32, 
+                 hidden_dim=768, 
+                 num_layers=2, 
+                 num_heads=16):
+        super().__init__()
+        
+        self.query_tokens = nn.Parameter(torch.randn(1, num_queries, hidden_dim))
+
+        self.layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=hidden_dim, 
+                nhead=num_heads, 
+                batch_first=True, 
+                norm_first=True
+            )
+            for _ in range(num_layers)
+        ])
+
+    def forward(self, vision_tokens):
+        """
+        vision_tokens: Tensor of shape (B, T*N, D)
+        returns: (B, num_queries, D)
+        """
+        B = vision_tokens.size(0)
+        queries = self.query_tokens.expand(B, -1, -1)  # (B, num_queries, D)
+
+        # Cross-attention: let queries attend to vision tokens
+        for layer in self.layers:
+            # Concatenate queries + vision tokens
+            tokens = torch.cat([queries, vision_tokens], dim=1)  # (B, num_queries + T*N, D)
+            tokens = layer(tokens)
+            queries = tokens[:, :queries.size(1)]  # extract updated queries
+
+        return queries  # (B, num_queries, D)
+
+
 
 class OLMoVisionBackbone(nn.Module):
     def __init__(self, config: FullMolmoConfig):
         super().__init__()
         self.config = config
         self.image_vit = VisionTransformer(config)
+
         input_dim: int = None
         self.image_pooling_2d: nn.Module = None
         if config.image_pooling_2d in {ImagePooling2DType.attention, ImagePooling2DType.attention_meanq}:
@@ -1273,6 +1315,11 @@ class OLMoVisionBackbone(nn.Module):
             self.image_pooling_2d = None
             nlayers = 1 if config.vit_layers is None else len(config.vit_layers)
             input_dim = nlayers * config.vision_backbone.image_emb_dim
+        elif config.image_pooling_2d == 'qformer':
+            n_layers = len(config.vit_layers)
+            dim = n_layers * config.vision_backbone.image_emb_dim
+            self.image_pooling_2d = QFormer(hidden_dim= dim)
+            input_dim = config.vision_backbone.image_emb_dim
         else:
             raise NotImplementedError(f"Unknown image pooling 2D method: {config.image_pooling_2d}")
 
@@ -1431,19 +1478,20 @@ class OLMoPretrainedVisionBackbone(OLMoVisionBackbone):
             dh=cfg.image_pooling_h,
             dw=cfg.image_pooling_w,
         )
-
         if cfg.image_pooling_2d == ImagePooling2DType.attention_meanq:
             query = image_features.mean(-2, keepdim=True)
             image_features = self.image_pooling_2d(query, image_features)
+        elif cfg.image_pooling_2d == 'qformer':
+            image_features = self.image_pooling_2d(image_features)
         elif cfg.image_pooling_2d not in {ImagePooling2DType.none, ImagePooling2DType.stack}:
             if self.grad_checkpointing:
                 from torch.utils.checkpoint import checkpoint
                 image_features = checkpoint(self.image_pooling_2d, image_features[:, :1, :], image_features, use_reentrant=False)
             else:
                 image_features = self.image_pooling_2d(image_features[:, :1, :], image_features)
-
         h, w = cfg.llm_patches_per_crop()
         image_features = image_features.reshape(batch_size, num_image, h * w, -1)
+
         # MLP layer to map the feature.
         if self.grad_checkpointing:
             from torch.utils.checkpoint import checkpoint
@@ -1893,6 +1941,7 @@ class Molmo(nn.Module):
 
             # For hf demo/endpoint
             image_features = image_features.to(x.device)
+            print(f'X: {x.shape}')
             x[batch_idx[valid], image_input_idx[valid]] += image_features[valid]
 
         if not self.config.rope:
@@ -2062,10 +2111,11 @@ class MolmoForCausalLM(PreTrainedModel):
 
     def __init__(self, config: MolmoConfig, model: Optional[Molmo] = None, init_params: bool = False):
         super().__init__(config)
+
         if not model:
             full_config = FullMolmoConfig(
                 image_padding_embed=None,
-                image_pooling_2d="attention",
+                image_pooling_2d="qformer",
                 attention_layer_norm=config.attention_layer_norm,
                 rope_impl="llama",
                 vocab_size=config.vocab_size,

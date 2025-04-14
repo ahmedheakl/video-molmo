@@ -1,5 +1,5 @@
 import logging
-import math
+import math, re
 from copy import deepcopy
 from dataclasses import fields, dataclass, replace
 from enum import Enum
@@ -7,7 +7,7 @@ from typing import List, Optional, Tuple, Union, Dict, Any, Sequence, Callable, 
 
 import torch
 from einops import einsum, einops
-from transformers import PreTrainedModel, GenerationConfig
+from transformers import PreTrainedModel, GenerationConfig, AutoTokenizer
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import CausalLMOutputWithPast, ModelOutput
 from transformers.models.auto import AutoModelForCausalLM
@@ -15,6 +15,9 @@ from torch import nn
 
 from .config_molmo import MolmoConfig
 from torch.nn import functional as F
+
+model_id = "allenai/Molmo-7B-D-0924"
+tokenizer = AutoTokenizer.from_pretrained(model_id)
 
 
 log = logging.getLogger(__name__)
@@ -630,6 +633,7 @@ class VisionBackboneConfig:
     initializer_range: float = 0.02
     fsdp_wrap: bool = False
     resize_mode: str = "default"
+    max_frames: int = 2
 
     def __post_init__(self):
         self.image_default_input_size = tuple(self.image_default_input_size)  # type: ignore[assignment]
@@ -847,6 +851,7 @@ class VisionTransformer(nn.Module):
         super().__init__()
         self.config = config
         v_cfg = config.vision_backbone
+        self.v_cfg = v_cfg
         # class embeddings and positional embeddings
         self.scale = v_cfg.image_emb_dim ** -0.5
         self.class_embedding = nn.Parameter(
@@ -855,6 +860,9 @@ class VisionTransformer(nn.Module):
         self.num_prefix_tokens: int = 1
         self.positional_embedding = nn.Parameter(
             torch.zeros(v_cfg.image_num_pos, v_cfg.image_emb_dim, device=config.init_device),
+        )
+        self.temporal_embedding = nn.Parameter(
+            torch.zeros(v_cfg.max_frames, v_cfg.image_emb_dim, device=config.init_device),
         )
         image_patch_size = v_cfg.image_patch_size
         self.patch_embedding = nn.Linear(
@@ -871,18 +879,21 @@ class VisionTransformer(nn.Module):
 
         self.transformer = BlockCollection(config)
 
+
     @torch.jit.ignore
     def set_grad_checkpointing(self, enable=True):
         self.transformer.grad_checkpointing = enable
+
 
     def reset_parameters(self):
         nn.init.normal_(self.class_embedding, std=self.scale)
         nn.init.normal_(self.positional_embedding, std=self.scale)
         nn.init.normal_(self.patch_embedding.weight, std=0.02)
+        nn.init.normal_(self.temporal_embedding, std=self.scale)
         self.pre_ln.reset_parameters()
         self.transformer.reset_parameters()
 
-    def add_pos_emb(self, x: torch.Tensor, patch_num: int) -> torch.Tensor:
+    def add_pos_emb(self, x: torch.Tensor, patch_num: int, max_frames: int) -> torch.Tensor:
         cls_emb = self.positional_embedding[0:1]
         pos_emb = self.positional_embedding[1:]
 
@@ -903,6 +914,14 @@ class VisionTransformer(nn.Module):
 
         pos_emb = pos_emb.reshape(-1, pos_emb.shape[-1])
         x = x + torch.cat([cls_emb[None, :, :], pos_emb[None, :, :]], dim=1).to(x.dtype)
+
+        # add temporal embedding
+        if x.shape[0] % max_frames == 0:
+            crops = x.shape[0] // max_frames
+            temp_emb = self.temporal_embedding
+            temp_emb = temp_emb.repeat_interleave(crops, dim=0)
+            temp_emb = temp_emb.unsqueeze(1)
+            x = x + temp_emb
         return x
 
     def forward(self, x: torch.Tensor, patch_num: int = None) -> List[torch.Tensor]:
@@ -916,7 +935,7 @@ class VisionTransformer(nn.Module):
         x = self.patch_embedding(x)
         # class embeddings and positional embeddings
         x = torch.cat([_expand_token(self.class_embedding, x.shape[0]).to(x.dtype), x], dim=1)
-        x = self.add_pos_emb(x, patch_num)
+        x = self.add_pos_emb(x, patch_num, self.v_cfg.max_frames)
 
         x = self.pre_ln(x)
 
@@ -2181,8 +2200,21 @@ class MolmoForCausalLM(PreTrainedModel):
                 labels.masked_fill_(~(loss_masks > 0), -100)
                 labels = labels.view(-1)
                 logits_for_loss = logits.to(torch.float32).view(-1, logits.size(-1))
-                
-                
+
+                # get the indices where there are point tokens
+                indices = []
+                float_re = re.compile(r'^-?\d*\.\d+$|^-?\d+$|^\.$|^-$')
+                for i, idx in enumerate(labels.tolist()):
+                    if idx == -100:
+                        continue
+                    tok = tokenizer.convert_ids_to_tokens(idx)
+                    # check if this token looks like a float
+                    if float_re.match(tok):
+                        indices.append(i)
+                weights = torch.ones(labels.shape)
+                weights[indices] *= 4
+                weights = weights.to(logits.device)
+
                 # Validate labels range (ignoring -100)
                 vocab_size = logits_for_loss.size(-1) #TODO
                 validate_labels(labels, vocab_size, ignore_index=-100) #TODO
@@ -2191,6 +2223,7 @@ class MolmoForCausalLM(PreTrainedModel):
                 loss = loss_fct(logits_for_loss, labels)
                 loss = loss.view(input_ids.shape[0], -1)
                 loss = loss * loss_masks
+                loss = loss * weights
                 loss = loss.sum() / batch_size_in_tokens
             else:
                 # Shift so that tokens < n predict n

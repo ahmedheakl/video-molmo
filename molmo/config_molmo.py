@@ -57,4 +57,4 @@ class MolmoConfig(PretrainedConfig):
             **kwargs,
         )
 
-MolmoConfig.register_for_auto_class()
+# MolmoConfig.register_for_auto_class()
