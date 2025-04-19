@@ -38,9 +38,9 @@ from peft import LoraConfig, get_peft_model
 from utils import get_coords, compute_mse_points, plot_metric, extract_caption, \
                     pil_to_np
 
-num_frames = 2 #TODO: 
+num_frames = 5 #TODO: 
 
-method = 'wo_attention'
+method = 'memory_mean'
 base_data_dir = '/l/users/salman.khan/molmo/pointing_dataset'
 output_dir = f'/l/users/salman.khan/workspace_pointing_lmm/models/{method}'
 annotation_dir = "/l/users/salman.khan/workspace_pointing_lmm/datasets/annotations" 
@@ -153,6 +153,7 @@ def random_augmentation(batch):
         black = Image.new(mode="RGB", size=(w, h), color=(0, 0, 0))
         nn = num_frames - len(images)
         prev_frames = [black for i in range(nn)] + prev_frames
+        assert len(prev_frames) == num_frames - 1
         new_batch["prev_frames"].append(prev_frames)
 
         selected_points = {int(k): points[k] for k in selected_frame_idxs[-1:]}
@@ -234,16 +235,17 @@ def collate_fn(examples):
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 processor = MultiModalPreprocessor(tokenizer=tokenizer)
 
+path = '/l/users/salman.khan/workspace_pointing_lmm/models/memory_mean/checkpoints/checkpoint-300'
 model = MolmoForCausalLM.from_pretrained(
-    model_id,
+    path,
     torch_dtype=torch.bfloat16,
     device_map="auto",
 )
 
-nn.init.xavier_normal_(model.model.vision_backbone.adapter.wq.weight)
-nn.init.xavier_normal_(model.model.vision_backbone.adapter.wk.weight)
-nn.init.xavier_normal_(model.model.vision_backbone.adapter.wv.weight)
-nn.init.xavier_normal_(model.model.vision_backbone.adapter.wo.weight)
+# nn.init.xavier_normal_(model.model.vision_backbone.adapter.wq.weight)
+# nn.init.xavier_normal_(model.model.vision_backbone.adapter.wk.weight)
+# nn.init.xavier_normal_(model.model.vision_backbone.adapter.wv.weight)
+# nn.init.xavier_normal_(model.model.vision_backbone.adapter.wo.weight)
 
 trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 total_params = sum(p.numel() for p in model.parameters())
@@ -335,21 +337,21 @@ training_args = SFTConfig(
     optim="paged_adamw_32bit",
     learning_rate=5e-6,
     lr_scheduler_type="cosine", 
-    logging_steps=2, 
+    logging_steps=10, 
     eval_strategy= "no",
     save_strategy="steps",
-    save_steps=400, 
+    save_steps=300, 
     bf16=True, 
     tf32=True,  
     max_grad_norm=0.7, 
     warmup_ratio=0.03,  
-    report_to="wandb",
     push_to_hub=False, 
-    report_to=None,  
+    report_to='wandb',  
     dataset_text_field="", 
     dataset_kwargs={"skip_prepare_dataset": True},  
     dataloader_pin_memory=False,
-    resume_from_checkpoint=True
+    resume_from_checkpoint=True,
+    ignore_data_skip=False
 )
 
 training_args.remove_unused_columns = False  

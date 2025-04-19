@@ -1525,8 +1525,16 @@ class OLMoPretrainedVisionBackbone(OLMoVisionBackbone):
         cfg = self.config
 
         # image_features: (batch_size, num_crops(=num_image), num_patch, nximage_emb_dim)
-        batch_size, num_image = images.shape[:2]
+        batch_size, num_image, num_patch = images.shape[:3]
         image_features, cls_embed = self.encode_image(images)
+        
+        # MODIFY
+        # take the mean of the crops for the previous frames
+        num_frames = prev_frames.shape[1]//image_features.shape[1]
+        prev_frames = prev_frames.view(batch_size, num_frames, num_image, num_patch, -1)
+        prev_frames = prev_frames.mean(dim=1)
+        # MODIFY
+        
         prev_features, _ = self.encode_image(prev_frames)
        
         if cfg.image_padding_embed:
@@ -1586,17 +1594,21 @@ class OLMoPretrainedVisionBackbone(OLMoVisionBackbone):
         )
 
         # # MODIFY
-        # adapted_features = self.adapter(image_features, prev_features)
-        # num_frames = prev_features.shape[0] // image_features.shape[0]
-        # b, p, d = image_features.shape
-        # adapted_features = adapted_features.view(b, num_frames, p, d)
-        # adapted_features = adapted_features.mean(dim=1)
-        # image_features = image_features + adapted_features
+        # image_features = image_features + prev_features
         # # MODIFY
 
         # MODIFY
-        image_features = image_features + prev_features
+        adapted_features = self.adapter(image_features, prev_features)
+        num_frames = prev_features.shape[0] // image_features.shape[0]
+        b, p, d = image_features.shape
+        adapted_features = adapted_features.view(b, num_frames, p, d)
+        adapted_features = adapted_features.mean(dim=1)
+        image_features = image_features + adapted_features
         # MODIFY
+
+
+
+
 
         if cfg.image_pooling_2d == ImagePooling2DType.attention_meanq:  
             query = image_features.mean(-2, keepdim=True)
