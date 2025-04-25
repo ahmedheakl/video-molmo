@@ -1,4 +1,4 @@
-import os, glob
+import os, glob, argparse
 import random
 from PIL import Image
 from transformers import AutoTokenizer
@@ -30,13 +30,18 @@ from datasets import load_dataset
 from utils import compute_mse_points, plot_metric, extract_caption, \
                     pil_to_np
 
-num_frames = 4 #TODO: 
+parser = argparse.ArgumentParser(description="Training script for MolmoVideo")
+parser.add_argument('--method', type=str, default='memory_mean')
+parser.add_argument('--model_id', type=str, default="allenai/Molmo-7B-D-0924", help='Model version to train')
+parser.add_argument('--num_frames', type=int, default=4, choices=[0, 1, 2, 3, 4], help='number of previous frames to use')
+parser.add_argument('--base_data_dir', type=str, default='/share/data/drive_2/shehan/pointing_dataset', help='path to the dataset directory')
+parser.add_argument('--output_dir', type=str, default='/share/data/drive_2/shehan/videomolmo/', help='path to the dataset directory')
+parser.add_argument('--annotation_dir', type=str, default="/share/users/shehan/workspace_pointing_lmm/DataPrep/annotations", help='Path to the annotation directory')
+parser.add_argument('--bfloat16', action='store_false', help='whether to use bfloat16 or not')
 
-method = 'memory_mean'
-base_data_dir = '/share/data/drive_1/heakl/data'
-output_dir = f'/share/data/drive_1/heakl/models/{method}'
-annotation_dir = "/share/data/drive_1/heakl/data/annotations" 
-annotation_files = glob.glob(f"{annotation_dir}/*.jsonl") 
+args = parser.parse_args()
+args.output_dir = os.path.join(args.output_dir, args.method)
+annotation_files = glob.glob(f"{args.annotation_dir}/*.jsonl") 
 
 dataset = load_dataset("json", 
                        data_files=annotation_files,
