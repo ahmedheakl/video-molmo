@@ -1537,23 +1537,31 @@ class OLMoPretrainedVisionBackbone(OLMoVisionBackbone):
         prev_features, _ = self.encode_image(prev_frames)
        
         if cfg.image_padding_embed:
-            assert image_masks is not None
-            if cfg.image_padding_embed == "pad_embed":
-                all_pad = (image_masks == 0).to(dtype=torch.float32)
-                pad_embed = self.pad_embed[None, None, None, :]
-                image_features = image_features + pad_embed * torch.unsqueeze(all_pad, -1)
-            elif cfg.image_padding_embed == "regress":
-                pad_embed = self.pad_embed[None, None, None, :]
-                image_features = image_features + pad_embed * torch.unsqueeze(torch.maximum(image_masks, torch.zeros_like(image_masks)), -1)
-            elif cfg.image_padding_embed == "pad_and_partial_pad":
-                pad_embed = self.pad_embed[:, None, None, None, :]
-                all_pad = image_masks == 0
-                partial_pad = torch.logical_and(image_masks < 1, torch.logical_not(all_pad)).to(dtype=image_features.dtype)
-                all_pad = all_pad.to(dtype=image_features.dtype)
-                image_features = image_features + pad_embed[0] * torch.unsqueeze(all_pad, -1)
-                image_features = image_features + pad_embed[1] * torch.unsqueeze(partial_pad, -1)
-            else:
-                raise ValueError(cfg.image_padding_embed)
+            if image_masks is not None:
+                if cfg.image_padding_embed == "pad_embed":
+                    all_pad = (image_masks == 0).to(dtype=torch.float32)
+                    pad_embed = self.pad_embed[None, None, None, :]
+                    image_features = image_features + pad_embed * torch.unsqueeze(all_pad, -1)
+                    # NEW
+                    prev_features = prev_features + pad_embed * torch.unsqueeze(all_pad, -1)
+                elif cfg.image_padding_embed == "regress":
+                    pad_embed = self.pad_embed[None, None, None, :]
+                    image_features = image_features + pad_embed * torch.unsqueeze(torch.maximum(image_masks, torch.zeros_like(image_masks)), -1)
+                    # NEW
+                    prev_features = prev_features + pad_embed * torch.unsqueeze(torch.maximum(image_masks, torch.zeros_like(image_masks)), -1)
+
+                elif cfg.image_padding_embed == "pad_and_partial_pad":
+                    pad_embed = self.pad_embed[:, None, None, None, :]
+                    all_pad = image_masks == 0
+                    partial_pad = torch.logical_and(image_masks < 1, torch.logical_not(all_pad)).to(dtype=image_features.dtype)
+                    all_pad = all_pad.to(dtype=image_features.dtype)
+                    image_features = image_features + pad_embed[0] * torch.unsqueeze(all_pad, -1)
+                    image_features = image_features + pad_embed[1] * torch.unsqueeze(partial_pad, -1)
+                    # NEW
+                    prev_features = prev_features + pad_embed[0] * torch.unsqueeze(all_pad, -1)
+                    prev_features = prev_features + pad_embed[1] * torch.unsqueeze(partial_pad, -1)
+                else:
+                    raise ValueError(cfg.image_padding_embed)
 
         image_features = self.image_feature_dropout(image_features)
         if cls_embed is not None:
@@ -2240,7 +2248,7 @@ class MolmoForCausalLM(PreTrainedModel):
         super().__init__(config)
         if not model:
             full_config = FullMolmoConfig(
-                image_padding_embed=None,
+                image_padding_embed='pad_and_partial_pad',
                 image_pooling_2d="attention-meanq",
                 attention_layer_norm=config.attention_layer_norm,
                 rope_impl="llama",

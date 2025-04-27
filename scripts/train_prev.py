@@ -137,7 +137,7 @@ def collate_fn(examples):
     
     # Now, collate the list of dictionaries into a single batch dictionary.
     # (Assuming each key in example_inputs is a tensor of the same shape across examples.)
-    def _collate(tensors, max_sequence_length=None, dtype=None, pad_value=0):
+    def _collate(tensors, max_sequence_length=None, dtype=None, pad_value=-1):
         max_len = max_sequence_length
         tensor = [x for x in tensors if x is not None][0]
         arr = np.full([len(tensors), max_len] + list(tensor.shape[1:]), pad_value,
@@ -151,7 +151,7 @@ def collate_fn(examples):
     padded_inputs = {}
 
     TEXT_KEYS = ["input_tokens", "loss_masks", "position_ids", "target_tokens", "position_ids"]
-    IMAGE_KEYS = ["images", "image_input_idx", "prev_frames"]
+    IMAGE_KEYS = ["images", "image_input_idx", "prev_frames", "image_masks"]
 
     for key in TEXT_KEYS:
         dtype = np.float32 if key == "loss_masks" else np.int64
@@ -194,80 +194,6 @@ trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 total_params = sum(p.numel() for p in model.parameters())
 print(f"Trainable percentage {trainable_params * 100 / total_params:.2f}")
 
-class CustomSFTTrainer(SFTTrainer):
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        if (self.label_smoother is not None or self.compute_loss_func is not None) and "labels" in inputs:
-            labels = inputs.pop("labels")
-        else:
-            labels = None
-        if self.model_accepts_loss_kwargs:
-            loss_kwargs = {}
-            if num_items_in_batch is not None:
-                loss_kwargs["num_items_in_batch"] = num_items_in_batch
-            inputs = {**inputs, **loss_kwargs}
-        outputs = model(**inputs)
-
-        if self.args.past_index >= 0:
-            self._past = outputs[self.args.past_index]
-
-        if labels is not None:
-            unwrapped_model = self.accelerator.unwrap_model(model)
-            if _is_peft_model(unwrapped_model):
-                model_name = unwrapped_model.base_model.model._get_name()
-            else:
-                model_name = unwrapped_model._get_name()
-
-            if self.compute_loss_func is not None:
-                loss = self.compute_loss_func(outputs, labels, num_items_in_batch=num_items_in_batch)
-            elif model_name in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
-                loss = self.label_smoother(outputs, labels, shift_labels=True)
-            else:
-                loss = self.label_smoother(outputs, labels)
-        else:
-            if isinstance(outputs, dict) and "loss" not in outputs:
-                raise ValueError(
-                    "The model did not return a loss from the inputs, only the following keys: "
-                    f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
-                )
-            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
-
-        if self.args.average_tokens_across_devices and self.model_accepts_loss_kwargs:
-            loss *= self.accelerator.num_processes
-
-        logits = outputs.logits
-        preds = logits.argmax(dim=-1)
-        labels = inputs.get("labels")
-        mask = labels!=-100
-        accuracy = (preds[mask].contiguous() == labels[mask].contiguous()).float().mean().item()
-        predicted_text = self.processing_class.decode(preds[mask], skip_special_tokens=True)
-        gt_text = self.processing_class.decode(labels[mask], skip_special_tokens=True)
-        point_loss = compute_mse_points(predicted_text, gt_text)
-        
-        self.point_loss += point_loss        
-        self.loss += loss.detach().item()
-        self.accuracy += accuracy
-        self.counter += 1
-        if self.counter == self.args.gradient_accumulation_steps:
-            avg_loss = self.loss / self.args.gradient_accumulation_steps
-            avg_accuracy = self.accuracy / self.args.gradient_accumulation_steps
-            avg_point_loss = self.point_loss / self.args.gradient_accumulation_steps
-            print(f"Loss: {avg_loss}, Mean token accuracy: {avg_accuracy} Point Loss: {avg_point_loss}")
-            print(f"pred text: {predicted_text}\n GT: {gt_text}")
-            self.loss_history.append(avg_loss)
-            self.accuracy_history.append(avg_accuracy)
-            self.point_loss_history.append(avg_point_loss)
-            # Reset accumulators
-            self.loss = 0.0
-            self.accuracy = 0.0
-            self.counter = 0
-            self.point_loss = 0.0
-
-        if self.state.global_step % 50 == 1:
-            plot_metric(self.loss_history, "Loss", folder=args.method)
-            plot_metric(self.accuracy_history, "Token Accuracy", folder=args.method)
-            plot_metric(self.point_loss_history, "Point Loss", folder=args.method)
-
-        return (loss, outputs) if return_outputs else loss
 
 gradient_accumulation_steps = 256 // args.batch_size
 
@@ -328,7 +254,7 @@ steps_per_epoch = math.ceil(len(augmented_dataset) / per_step_batch / grad_accum
 num_training_steps = steps_per_epoch * training_args.num_train_epochs
 num_warmup_steps = int(training_args.warmup_ratio * num_training_steps)
 
-trainer = CustomSFTTrainer(
+trainer = SFTTrainer(
     model=model,
     args=training_args,
     train_dataset=augmented_dataset,

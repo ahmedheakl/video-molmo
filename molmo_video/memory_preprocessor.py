@@ -311,7 +311,7 @@ class MultiModalPreprocessor:
     image_token_length_w: int = 12
     image_token_length_h: int = 12
     image_patch_size: int = 14
-    image_padding_mask: Union[bool, int] = False
+    image_padding_mask: Union[bool, int] = True
     pad_value: float = 0
 
     image_patch_token_id: int = dataclasses.field(init=False)
