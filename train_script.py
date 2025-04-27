@@ -355,7 +355,7 @@ if USE_QLORA:
         model_id,
         torch_dtype=torch.float16,
         quantization_config=bnb_config,
-        # device_map="auto",
+        # conda_map="auto",
     )
 else:
     model = MolmoForCausalLM.from_pretrained(

@@ -1523,7 +1523,6 @@ class OLMoPretrainedVisionBackbone(OLMoVisionBackbone):
 
     def forward(self, images: torch.Tensor, prev_frames: torch.Tensor, image_masks: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         cfg = self.config
-
         # image_features: (batch_size, num_crops(=num_image), num_patch, nximage_emb_dim)
         batch_size, num_image, num_patch = images.shape[:3]
         image_features, cls_embed = self.encode_image(images)
@@ -1605,10 +1604,7 @@ class OLMoPretrainedVisionBackbone(OLMoVisionBackbone):
         adapted_features = adapted_features.mean(dim=1)
         image_features = image_features + adapted_features
         # MODIFY
-
-
-
-
+        
 
         if cfg.image_pooling_2d == ImagePooling2DType.attention_meanq:  
             query = image_features.mean(-2, keepdim=True)
@@ -2363,7 +2359,6 @@ class MolmoForCausalLM(PreTrainedModel):
                 labels.masked_fill_(~(loss_masks > 0), -100)
                 labels = labels.view(-1)
                 logits_for_loss = logits.to(torch.float32).view(-1, logits.size(-1))
-                
                 
                 # Validate labels range (ignoring -100)
                 vocab_size = logits_for_loss.size(-1) #TODO

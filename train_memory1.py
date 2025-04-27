@@ -38,7 +38,7 @@ from peft import LoraConfig, get_peft_model
 from utils import get_coords, compute_mse_points, plot_metric, extract_caption, \
                     pil_to_np
 
-num_frames = 4 #TODO: 
+num_frames = 5 #TODO: 
 
 method = 'memory_mean'
 base_data_dir = '/l/users/salman.khan/molmo/pointing_dataset'
@@ -53,7 +53,6 @@ dataset = load_dataset("json",
 print(f"Total Number of Samples: {len(dataset)}")
 
 PROMPT_TEMPLATES = [
-        "Point to {label}",
         "Point to {label}\nPlease say 'This isn't in the image.' if it is not in the image.",
         "Point to all occurrences of \"{label}\"",
         "Point to any {label} in the image",
@@ -82,6 +81,7 @@ PROMPT_TEMPLATES = [
         "find any {label} in the picture",
         "Find {label}",
         "Find any {label}",
+        "Point to {label}",
         "Point to {label}",
         "Look for {label} in the image and show me where they are.",
         "Help me find an object in the image by pointing to them.\nObject: {label}.",
@@ -130,8 +130,11 @@ def random_augmentation(batch):
         frame_idxs = batch["frame_idxs"][i]    # e.g. [0, 1, 2, ...]
         points = batch["points"][i]
         caption = batch["caption"][i]
+        if len(frame_idxs) <= num_frames:
+            selected_indices = list(range(len(frame_idxs)))
+        else:
+            selected_indices = sorted(random.sample(range(len(frame_idxs)), num_frames))
 
-        selected_indices = sorted(random.sample(range(len(frame_idxs)), 1))
         selected_frame_idxs = [frame_idxs[j] for j in selected_indices]
         images = []
         for j in selected_indices:
@@ -145,23 +148,12 @@ def random_augmentation(batch):
             images.append(image)
             
         w, h = images[-1].size
-        idx = selected_indices[0]
-        prev_frames = []
-        for j in range(max(0, idx - 4), idx):
-            frame_filename = f"{frame_idxs[j]:05d}.jpg"
-            frame_path = os.path.join(base_data_dir, video_dir, frame_filename)
-            try:
-                image = Image.open(frame_path).convert("RGB")
-            except Exception as e:
-                print(f"Error loading image {frame_path}: {e}")
-                image = None
-            prev_frames.append(image.resize((w, h)))
-        
+        images = [image.resize((w, h)) for image in images]  
+        prev_frames = images[:-1]
         black = Image.new(mode="RGB", size=(w, h), color=(0, 0, 0))
-        prev_frames = [black for i in range(num_frames - len(prev_frames))] + prev_frames
-
-        assert len(prev_frames) == num_frames, f"Expected {num_frames} frames, but got {len(prev_frames)}"
-
+        nn = num_frames - len(images)
+        prev_frames = [black for i in range(nn)] + prev_frames
+        assert len(prev_frames) == num_frames - 1
         new_batch["prev_frames"].append(prev_frames)
 
         selected_points = {int(k): points[k] for k in selected_frame_idxs[-1:]}
@@ -173,7 +165,6 @@ def random_augmentation(batch):
         new_batch["question"].append(question)
         answer = get_points_in_xml_format(selected_points, caption)
         new_batch["answer"].append(answer)
-
     return new_batch
 
 
@@ -238,22 +229,23 @@ def collate_fn(examples):
     padded_inputs["prev_frames"] = torch.cat([example for example in batch_inputs["prev_frames"]], 0)
     padded_inputs["image_input_idx"] = torch.cat([example for example in batch_inputs["image_input_idx"]], 0)
     padded_inputs["position_ids"] = torch.cat([example for example in batch_inputs["position_ids"]], 0)
-    import pdb; pdb.set_trace()
+
     return padded_inputs
 
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 processor = MultiModalPreprocessor(tokenizer=tokenizer)
 
+path = '/l/users/salman.khan/workspace_pointing_lmm/models/memory_mean/checkpoints/checkpoint-300'
 model = MolmoForCausalLM.from_pretrained(
-    model_id,
+    path,
     torch_dtype=torch.bfloat16,
     device_map="auto",
 )
 
-nn.init.xavier_normal_(model.model.vision_backbone.adapter.wq.weight)
-nn.init.xavier_normal_(model.model.vision_backbone.adapter.wk.weight)
-nn.init.xavier_normal_(model.model.vision_backbone.adapter.wv.weight)
-nn.init.xavier_normal_(model.model.vision_backbone.adapter.wo.weight)
+# nn.init.xavier_normal_(model.model.vision_backbone.adapter.wq.weight)
+# nn.init.xavier_normal_(model.model.vision_backbone.adapter.wk.weight)
+# nn.init.xavier_normal_(model.model.vision_backbone.adapter.wv.weight)
+# nn.init.xavier_normal_(model.model.vision_backbone.adapter.wo.weight)
 
 trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 total_params = sum(p.numel() for p in model.parameters())
@@ -334,7 +326,7 @@ class CustomSFTTrainer(SFTTrainer):
 
         return (loss, outputs) if return_outputs else loss
 
-gradient_accumulation_steps = 200
+gradient_accumulation_steps = 256
 
 training_args = SFTConfig(
     output_dir=f"{output_dir}/checkpoints",  

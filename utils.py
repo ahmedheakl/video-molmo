@@ -11,22 +11,24 @@ SYSTEM_PROMPT = (
 )
 
 PROMPT_TEMPLATES = [
-        "Point to {label}\nPlease say 'This isn't in the video.' if it is not in the video.",
+        "Point to {label}",
+        "Point to {label}\nPlease say 'This isn't in the image.' if it is not in the image.",
         "Point to all occurrences of \"{label}\"",
-        "Point to any {label} in the video",
-        "Point to any {label} in the video.",
-        "Point: Where are the {label}",
-        "Show me where the {label} are",
-        "Can you show me where the {label} are?",
-        "Show me where the {label} are",
+        "Point to any {label} in the image",
+        "Point to any {label} in the image.",
+        "Point: Where are {label}",
+        "Show me where {label} are",
+        "Can you show me where {label} are?",
+        "Show me where {label} are",
         "Show me where {label} is",
         "Show me where {label} is.",
-        "If there are any {label} in the video? Show me where they are.",
+        "If there are any {label} in the image? Show me where they are.",
         "Where are {label}?",
         "Generate a list of points showing where {label} are.",
         "Find \"{label}\".",
         "Find \"{label}\".",
         "Locate all {label}.",
+        "Locate {label}.",
         "Locate {label}.",
         "Locate every {label}.",
         "Locate {label}.",
@@ -39,43 +41,74 @@ PROMPT_TEMPLATES = [
         "Find {label}",
         "Find any {label}",
         "Point to {label}",
-        "Point to {label}",
-        "Look for {label} in the video and show me where they are.",
-        "Help me find an object in the video by pointing to them.\nObject: {label}.",
-        "I am looking for {label}, where can they be found in the video?",
-        "Can you see any {label} in the video? Point to them.",
-        "Point out each {label} in the video.",
-        "Point out every {label} in the video.",
-        "Point to {label} in the video.",
-        "Locate each {label} in the video.",
-        "Can you point out all {label} in this video?",
+        "Look for {label} in the image and show me where they are.",
+        "Help me find an object in the image by pointing to them.\nObject: {label}.",
+        "I am looking for {label}, where can they be found in the image?",
+        "Can you see any {label} in the image? Point to them.",
+        "Point out each {label} in the image.",
+        "Point out every {label} in the image.",
+        "Point to {label} in the image.",
+        "Locate each {label} in the image.",
+        "Can you point out all {label} in this image?",
         "Please find {label} and show me where they are.",
         "If there are any {label} present, indicate their positions.",
         "If there is {label} present, indicate its positions.",
         "show me all visible {label}",
     ]
 
-def extract_caption(caption):
-    # Remove common question words to extract the key label
-    label = re.sub(r"^(Where is|Where are|Find|Show me|Locate|Can you see|Segment the)", "", caption, flags=re.IGNORECASE).strip()
-    return label
-
-def get_points_in_xml_format(points, caption):
-    lines = ["<points"]
-    
+def get_points_in_xml_format(points, caption):   
     for t, xy_list in points.items():
-        line = f' t="{int(t)}"'
         xy_list = sorted(xy_list, key=lambda p: (p["x"], p["y"]))
+        if len(xy_list) == 1:
+            lines = ["<point"]
+        else:
+            lines = ["<points"] 
+        line = ''
         for i, xy in enumerate(xy_list):
             if len(xy_list) == 1:  
                 x, y = xy["x"], xy["y"]
+                if x==-1.0 and y==-1.0:
+                    return f' There are none.'
                 line += f' x="{x:.1f}" y="{y:.1f}"'
             else:
                 x, y = xy["x"], xy["y"]
                 line += f' x{i+1}="{x:.1f}" y{i+1}="{y:.1f}"'
         lines.append(line)
+        if len(xy_list) == 1:
+            lines.append(f' alt="{caption}">{caption}</point>')
+        else:
+            lines.append(f' alt="{caption}">{caption}</points>') 
+    output = "".join(lines)
+    return output
 
-    lines.append(f' alt="{caption}">{caption}</points>')
+
+def extract_caption(caption):
+    # Remove common question words to extract the key label
+    label = re.sub(r"^(Where is|Where are|Find|Show me|Locate|Can you see|Segment the)", "", caption, flags=re.IGNORECASE).strip()
+    return label
+
+def get_points_in_xml_format(points, caption):   
+    for t, xy_list in points.items():
+        xy_list = sorted(xy_list, key=lambda p: (p["x"], p["y"]))
+        if len(xy_list) == 1:
+            lines = ["<point"]
+        else:
+            lines = ["<points"] 
+        line = ''
+        for i, xy in enumerate(xy_list):
+            if len(xy_list) == 1:  
+                x, y = xy["x"], xy["y"]
+                if x==-1.0 and y==-1.0:
+                    return f' There are none.'
+                line += f' x="{x:.1f}" y="{y:.1f}"'
+            else:
+                x, y = xy["x"], xy["y"]
+                line += f' x{i+1}="{x:.1f}" y{i+1}="{y:.1f}"'
+        lines.append(line)
+        if len(xy_list) == 1:
+            lines.append(f' alt="{caption}">{caption}</point>')
+        else:
+            lines.append(f' alt="{caption}">{caption}</points>') 
     output = "".join(lines)
     return output
 
@@ -294,3 +327,17 @@ def pil_to_np(images):
             image_arrays.append(np.array(image))
     images = image_arrays
     return images
+
+numpy_to_torch_dtype_dict = {
+    np.dtype("bool"): torch.bool,
+    np.dtype("uint8"): torch.uint8,
+    np.dtype("int8"): torch.int8,
+    np.dtype("int16"): torch.int16,
+    np.dtype("int32"): torch.int32,
+    np.dtype("int64"): torch.int64,
+    np.dtype("float16"): torch.float16,
+    np.dtype("float32"): torch.float32,
+    np.dtype("float64"): torch.float64,
+    np.dtype("complex64"): torch.complex64,
+    np.dtype("complex128"): torch.complex128,
+}

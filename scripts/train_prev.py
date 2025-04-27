@@ -1,127 +1,45 @@
-import os
+import os, glob, argparse, sys
 import random
 from PIL import Image
 from transformers import AutoTokenizer
-from molmo_video.memory_preprocessor import MultiModalPreprocessor
-import torch
+import torch, math
 from torch import nn
 import numpy as np
 import torch.nn.functional as F
-from transformers.modeling_outputs import CausalLMOutputWithPast, ModelOutput
-from functools import partial
-from datasets import concatenate_datasets
 
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Type, Union
-
-model_id = "allenai/Molmo-7B-D-0924"
+from datasets import load_dataset
 
 from molmo_video.memory import MolmoForCausalLM
-from molmo_video.preprocessor import (FRAME_START_TOKEN, FRAME_END_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_COL_TOKEN, IMAGE_PROMPT)
-from transformers import BitsAndBytesConfig
-from torch.utils.data import DataLoader
-
+from molmo_video.memory_preprocessor import MultiModalPreprocessor
 from trl import (
-    ModelConfig,
-    ScriptArguments,
     SFTTrainer,
-    TrlParser,
-    get_kbit_device_map,
-    get_peft_config,
-    get_quantization_config,
     SFTConfig
 )
 
-from datasets import load_dataset
-import glob
-from peft import LoraConfig, get_peft_model
+from utils import get_points_in_xml_format, compute_mse_points, plot_metric, extract_caption, \
+                    pil_to_np, PROMPT_TEMPLATES
 
-from utils import get_coords, compute_mse_points, plot_metric, extract_caption, \
-                    pil_to_np
+from optimizer import build_optimizer
 
-num_frames = 4 #TODO: 
+parser = argparse.ArgumentParser(description="Training script for VideoMolmo")
+parser.add_argument('--method', type=str, default='memory_mean')
+parser.add_argument('--model_id', type=str, default="allenai/Molmo-7B-D-0924", help='Model version to train')
+parser.add_argument('--num_frames', type=int, default=4, choices=[0, 1, 2, 3, 4], help='number of previous frames to use')
+parser.add_argument('--base_data_dir', type=str, default='/l/users/salman.khan/molmo/pointing_dataset', help='path to the dataset directory')
+parser.add_argument('--output_dir', type=str, default=f'/l/users/salman.khan/workspace_pointing_lmm/models', help='path to the output directory')
+parser.add_argument('--annotation_dir', type=str, default="/l/users/salman.khan/workspace_pointing_lmm/datasets/annotations" , help='Path to the annotation directory')
+parser.add_argument('--bfloat16', action='store_true', help='whether to use bfloat16 or not')
+parser.add_argument('--batch_size', type=int, default=1, help='batch size')
 
-method = 'memory_mean'
-base_data_dir = '/l/users/salman.khan/molmo/pointing_dataset'
-output_dir = f'/l/users/salman.khan/workspace_pointing_lmm/models/{method}'
-annotation_dir = "/l/users/salman.khan/workspace_pointing_lmm/datasets/annotations" 
-annotation_files = glob.glob(f"{annotation_dir}/*.jsonl") 
+args = parser.parse_args()
+args.output_dir = os.path.join(args.output_dir, args.method)
+annotation_files = glob.glob(f"{args.annotation_dir}/*.jsonl") 
 
 dataset = load_dataset("json", 
                        data_files=annotation_files,
                        split="train")
 
 print(f"Total Number of Samples: {len(dataset)}")
-
-PROMPT_TEMPLATES = [
-        "Point to {label}",
-        "Point to {label}\nPlease say 'This isn't in the image.' if it is not in the image.",
-        "Point to all occurrences of \"{label}\"",
-        "Point to any {label} in the image",
-        "Point to any {label} in the image.",
-        "Point: Where are {label}",
-        "Show me where {label} are",
-        "Can you show me where {label} are?",
-        "Show me where {label} are",
-        "Show me where {label} is",
-        "Show me where {label} is.",
-        "If there are any {label} in the image? Show me where they are.",
-        "Where are {label}?",
-        "Generate a list of points showing where {label} are.",
-        "Find \"{label}\".",
-        "Find \"{label}\".",
-        "Locate all {label}.",
-        "Locate {label}.",
-        "Locate {label}.",
-        "Locate every {label}.",
-        "Locate {label}.",
-        "Locate {label}.",
-        "Object: {label}\nInstruction: Point to the object.",
-        "find {label}",
-        "find {label}.",
-        "Point to every {label}",
-        "find any {label} in the picture",
-        "Find {label}",
-        "Find any {label}",
-        "Point to {label}",
-        "Look for {label} in the image and show me where they are.",
-        "Help me find an object in the image by pointing to them.\nObject: {label}.",
-        "I am looking for {label}, where can they be found in the image?",
-        "Can you see any {label} in the image? Point to them.",
-        "Point out each {label} in the image.",
-        "Point out every {label} in the image.",
-        "Point to {label} in the image.",
-        "Locate each {label} in the image.",
-        "Can you point out all {label} in this image?",
-        "Please find {label} and show me where they are.",
-        "If there are any {label} present, indicate their positions.",
-        "If there is {label} present, indicate its positions.",
-        "show me all visible {label}",
-    ]
-
-def get_points_in_xml_format(points, caption):   
-    for t, xy_list in points.items():
-        xy_list = sorted(xy_list, key=lambda p: (p["x"], p["y"]))
-        if len(xy_list) == 1:
-            lines = ["<point"]
-        else:
-            lines = ["<points"] 
-        line = ''
-        for i, xy in enumerate(xy_list):
-            if len(xy_list) == 1:  
-                x, y = xy["x"], xy["y"]
-                if x==-1.0 and y==-1.0:
-                    return f' There are none.'
-                line += f' x="{x:.1f}" y="{y:.1f}"'
-            else:
-                x, y = xy["x"], xy["y"]
-                line += f' x{i+1}="{x:.1f}" y{i+1}="{y:.1f}"'
-        lines.append(line)
-        if len(xy_list) == 1:
-            lines.append(f' alt="{caption}">{caption}</point>')
-        else:
-            lines.append(f' alt="{caption}">{caption}</points>') 
-    output = "".join(lines)
-    return output
 
 def random_augmentation(batch):
     new_batch = {"images": [], "frame_idxs": [], "points": [], "question": [], "answer": [], "prev_frames": []}
@@ -136,7 +54,7 @@ def random_augmentation(batch):
         images = []
         for j in selected_indices:
             frame_filename = f"{frame_idxs[j]:05d}.jpg"
-            frame_path = os.path.join(base_data_dir, video_dir, frame_filename)
+            frame_path = os.path.join(args.base_data_dir, video_dir, frame_filename)
             try:
                 image = Image.open(frame_path).convert("RGB")
             except Exception as e:
@@ -149,7 +67,7 @@ def random_augmentation(batch):
         prev_frames = []
         for j in range(max(0, idx - 4), idx):
             frame_filename = f"{frame_idxs[j]:05d}.jpg"
-            frame_path = os.path.join(base_data_dir, video_dir, frame_filename)
+            frame_path = os.path.join(args.base_data_dir, video_dir, frame_filename)
             try:
                 image = Image.open(frame_path).convert("RGB")
             except Exception as e:
@@ -158,9 +76,9 @@ def random_augmentation(batch):
             prev_frames.append(image.resize((w, h)))
         
         black = Image.new(mode="RGB", size=(w, h), color=(0, 0, 0))
-        prev_frames = [black for i in range(num_frames - len(prev_frames))] + prev_frames
+        prev_frames = [black for i in range(args.num_frames - len(prev_frames))] + prev_frames
 
-        assert len(prev_frames) == num_frames, f"Expected {num_frames} frames, but got {len(prev_frames)}"
+        assert len(prev_frames) == args.num_frames, f"Expected {args.num_frames} frames, but got {len(prev_frames)}"
 
         new_batch["prev_frames"].append(prev_frames)
 
@@ -175,7 +93,6 @@ def random_augmentation(batch):
         new_batch["answer"].append(answer)
 
     return new_batch
-
 
 augmented_dataset = dataset.with_transform(random_augmentation)
 
@@ -216,40 +133,58 @@ def collate_fn(examples):
             )
         
         example_inputs = {k: torch.from_numpy(v).unsqueeze(0) for k, v in example_inputs.items()}
-        
         batch_outputs.append(example_inputs)
-
-    batch_inputs = {}
-    for key in batch_outputs[0]:
-        batch_inputs[key] = [ex[key] for ex in batch_outputs]
-
-    padded_inputs = tokenizer.pad({"input_ids": [ex[0] for ex in batch_inputs['input_tokens']],},
-        return_tensors="pt",
-    )
     
-    labels = torch.cat([example for example in batch_inputs["target_tokens"]], 0)
-    loss_masks = torch.cat([example for example in batch_inputs["loss_masks"]], 0)
-    loss_masks = loss_masks * (loss_masks > 0)    
-    labels.masked_fill_(~(loss_masks > 0), -100)
+    # Now, collate the list of dictionaries into a single batch dictionary.
+    # (Assuming each key in example_inputs is a tensor of the same shape across examples.)
+    def _collate(tensors, max_sequence_length=None, dtype=None, pad_value=0):
+        max_len = max_sequence_length
+        tensor = [x for x in tensors if x is not None][0]
+        arr = np.full([len(tensors), max_len] + list(tensor.shape[1:]), pad_value,
+                    dtype=dtype or tensor.dtype)
 
-    padded_inputs['labels'] = labels
-    padded_inputs["loss_masks"] = loss_masks
-    padded_inputs["images"] = torch.cat([example for example in batch_inputs["images"]], 0)
-    padded_inputs["prev_frames"] = torch.cat([example for example in batch_inputs["prev_frames"]], 0)
-    padded_inputs["image_input_idx"] = torch.cat([example for example in batch_inputs["image_input_idx"]], 0)
-    padded_inputs["position_ids"] = torch.cat([example for example in batch_inputs["position_ids"]], 0)
-    import pdb; pdb.set_trace()
+        for ix, tensor in enumerate(tensors):
+            if tensor is not None:
+                arr[ix, :len(tensor)] = tensor[:max_len]
+        return torch.from_numpy(arr)
+
+    padded_inputs = {}
+
+    TEXT_KEYS = ["input_tokens", "loss_masks", "position_ids", "target_tokens", "position_ids"]
+    IMAGE_KEYS = ["images", "image_input_idx", "prev_frames"]
+
+    for key in TEXT_KEYS:
+        dtype = np.float32 if key == "loss_masks" else np.int64
+        if key == 'input_tokens':
+            padded_inputs['input_ids'] = _collate([ex.get(key).squeeze(0) for ex in batch_outputs], max_sequence_length=1300, dtype=dtype)
+        elif key == 'target_tokens':
+            padded_inputs['labels'] = _collate([ex.get(key).squeeze(0) for ex in batch_outputs], max_sequence_length=1300, dtype=dtype)
+        else:
+            padded_inputs[key] = _collate([ex.get(key).squeeze(0) for ex in batch_outputs], max_sequence_length=1300, dtype=dtype)
+
+    for key in IMAGE_KEYS:
+        dtype = np.float32 if key == "loss_masks" else np.int64
+        if key == "image_input_idx":
+            padded_inputs[key] = _collate([ex.get(key).squeeze(0) for ex in batch_outputs], max_sequence_length=13, dtype=dtype)
+        else:
+            padded_inputs[key] = _collate([ex.get(key).squeeze(0) for ex in batch_outputs], max_sequence_length=13, dtype=np.float32)
+
+    loss_masks = padded_inputs['loss_masks']*(padded_inputs['loss_masks'] > 0)
+    padded_inputs['labels'].masked_fill_(~(loss_masks > 0), -100)
+
     return padded_inputs
 
-tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+tokenizer = AutoTokenizer.from_pretrained(args.model_id)
 processor = MultiModalPreprocessor(tokenizer=tokenizer)
 
 model = MolmoForCausalLM.from_pretrained(
-    model_id,
-    torch_dtype=torch.bfloat16,
-    device_map="auto",
+    args.model_id,
+    torch_dtype=torch.bfloat16 if args.bfloat16 else torch.float32,
+    device_map='auto',
 )
 
+# initialize the memory module weights
 nn.init.xavier_normal_(model.model.vision_backbone.adapter.wq.weight)
 nn.init.xavier_normal_(model.model.vision_backbone.adapter.wk.weight)
 nn.init.xavier_normal_(model.model.vision_backbone.adapter.wv.weight)
@@ -328,41 +263,70 @@ class CustomSFTTrainer(SFTTrainer):
             self.point_loss = 0.0
 
         if self.state.global_step % 50 == 1:
-            plot_metric(self.loss_history, "Loss", folder=method)
-            plot_metric(self.accuracy_history, "Token Accuracy", folder=method)
-            plot_metric(self.point_loss_history, "Point Loss", folder=method)
+            plot_metric(self.loss_history, "Loss", folder=args.method)
+            plot_metric(self.accuracy_history, "Token Accuracy", folder=args.method)
+            plot_metric(self.point_loss_history, "Point Loss", folder=args.method)
 
         return (loss, outputs) if return_outputs else loss
 
-gradient_accumulation_steps = 200
+gradient_accumulation_steps = 256 // args.batch_size
+
+ds_config = {
+    "zero_optimization": {
+      "stage": 3,
+      "offload_param": {
+        "device": "cpu"
+      },
+      "offload_optimizer": {
+        "device": "cpu"
+      }
+    },
+    "gradient_accumulation_steps": gradient_accumulation_steps,
+    
+    "train_batch_size": "auto",
+    "train_micro_batch_size_per_gpu": "auto",
+    
+    "gradient_clipping": "auto",
+    
+    "bf16": {
+      "enabled": True
+    }
+  }
 
 training_args = SFTConfig(
-    output_dir=f"{output_dir}/checkpoints",  
+    output_dir=f"{args.output_dir}/checkpoints",  
     num_train_epochs=4,  
-    per_device_train_batch_size=1,  
+    per_device_train_batch_size=args.batch_size,  
     gradient_accumulation_steps=gradient_accumulation_steps,
     gradient_checkpointing=False,  
     optim="paged_adamw_32bit",
     learning_rate=5e-6,
     lr_scheduler_type="cosine", 
-    logging_steps=10, 
+    logging_steps=1, 
     eval_strategy= "no",
     save_strategy="steps",
     save_steps=300, 
-    bf16=True, 
+    bf16=args.bfloat16, 
     tf32=True,  
-    max_grad_norm=0.7, 
-    warmup_ratio=0.03,  
+    max_grad_norm=1.0, 
+    warmup_ratio=0.0067,  
     push_to_hub=False, 
     report_to='wandb',  
     dataset_text_field="", 
     dataset_kwargs={"skip_prepare_dataset": True},  
     dataloader_pin_memory=False,
-    resume_from_checkpoint=True,
-    ignore_data_skip=False
+    resume_from_checkpoint=False,
+    ignore_data_skip=False,
+    # deepspeed=ds_config,
 )
 
 training_args.remove_unused_columns = False  
+
+per_step_batch = training_args.per_device_train_batch_size
+grad_accum    = training_args.gradient_accumulation_steps
+steps_per_epoch = math.ceil(len(augmented_dataset) / per_step_batch / grad_accum)
+num_training_steps = steps_per_epoch * training_args.num_train_epochs
+num_warmup_steps = int(training_args.warmup_ratio * num_training_steps)
 
 trainer = CustomSFTTrainer(
     model=model,
@@ -370,8 +334,9 @@ trainer = CustomSFTTrainer(
     train_dataset=augmented_dataset,
     data_collator=collate_fn,
     tokenizer=processor.tokenizer,
+    optimizers=build_optimizer(model, num_warmup_steps, num_training_steps)
 )
 
 trainer.train()
 
-trainer.save_model(output_dir)
+trainer.save_model(args.output_dir)

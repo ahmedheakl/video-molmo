@@ -36,11 +36,9 @@ DEFAULT_IM_START_TOKEN = f"<im_start>"
 DEFAULT_IM_END_TOKEN = f"<im_end>"
 DEFAULT_IM_COL_TOKEN = f"<im_col>"
 IMAGE_PROMPT = "<|image|>"
-DEFAULT_FRAME_START_TOKEN = f"<frame_start>"
-DEFAULT_FRAME_END_TOKEN = f"<frame_end>"
 
 EXTRA_TOKENS = (DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, DEFAULT_IMAGE_PATCH_TOKEN,
-                DEFAULT_IM_COL_TOKEN, IMAGE_PROMPT, DEFAULT_FRAME_START_TOKEN, DEFAULT_FRAME_END_TOKEN)
+                DEFAULT_IM_COL_TOKEN, IMAGE_PROMPT)
 
 
 def load_image(image_path):
@@ -320,25 +318,14 @@ class MultiModalPreprocessor:
     image_col_token_id: int = dataclasses.field(init=False)
     image_start_token_id: int = dataclasses.field(init=False)
     image_end_token_id: int = dataclasses.field(init=False)
-    frame_start_token_id: int = dataclasses.field(init=False)
-    frame_end_token_id: int = dataclasses.field(init=False)
 
     def __post_init__(self):
-        frame_tokens = {
-            "additional_special_tokens": [
-            "<frame_start>",  # Add the <frame_start> token
-            "<frame_end>"     # Add the <frame_end> token
-            ]
-        }
-        self.tokenizer.add_special_tokens(frame_tokens)
         special_tokens = get_special_token_ids(self.tokenizer)
         self.image_end_token_id = special_tokens[tokenizer.DEFAULT_IM_END_TOKEN]
         self.image_start_token_id = special_tokens[tokenizer.DEFAULT_IM_START_TOKEN]
         self.image_col_token_id = special_tokens[tokenizer.DEFAULT_IM_COL_TOKEN]
         self.image_patch_token_id = special_tokens[tokenizer.DEFAULT_IMAGE_PATCH_TOKEN]
         self.image_prompt_token_id = special_tokens[tokenizer.IMAGE_PROMPT]
-        self.frame_start_token_id = special_tokens[tokenizer.DEFAULT_FRAME_START_TOKEN]
-        self.frame_end_token_id = special_tokens[tokenizer.DEFAULT_FRAME_END_TOKEN]
 
     def _normalize(self, image):
         if self.normalize == "openai":
@@ -574,12 +561,7 @@ class MultiModalPreprocessor:
                         extra_tokens,
                         [self.image_end_token_id],
                     ] + joint
-            # NEW: add frame start and frame end token ids
-            joint = [
-                        [self.frame_start_token_id],
-                        *joint,
-                        [self.frame_end_token_id]
-                    ]
+            
             joint = np.concatenate(joint, 0)
             img_mask = np.pad(img_mask, [[0, 1], [0, 0]], constant_values=-1)
             return patches, joint, patch_ordering, img_mask
@@ -825,7 +807,10 @@ class MultiModalPreprocessor:
             crops, image_tokens, patch_idx, img_mask = self.preprocess(prev_frames[ix], is_training, rng)
             all_crops.append(crops)
         prev_frames = np.concatenate(all_crops, 0)
-
+        m, p, d = prev_frames.shape
+        prev_frames = prev_frames.reshape(n, m//n, p, d)
+        prev_frames = prev_frames.mean(axis=0)
+        
         out = {
             "input_tokens": input_ids,
             "images": images,
